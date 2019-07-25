@@ -1,0 +1,286 @@
+
+import inspect
+import sys
+import atexit
+import os
+import readline
+import rlcompleter
+
+# command-line completion in python
+if 'libedit' in readline.__doc__:
+    readline.parse_and_bind("bind ^I rl_complete")
+else:
+    readline.parse_and_bind("tab: complete")
+
+# history
+historyPath = os.path.expanduser("~/.pyhistory")
+
+def save_history(historyPath=historyPath):
+    import readline
+    readline.write_history_file(historyPath)
+
+if os.path.exists(historyPath):
+    readline.read_history_file(historyPath)
+
+atexit.register(save_history)
+del atexit, readline, rlcompleter, save_history, historyPath
+
+# EBB's pythonrc making python quicker to use in development
+print('Interactive -> importing np, math, plt')
+from dis import dis
+import numpy as np
+import math
+import matplotlib
+# only needed for Mac setups
+#matplotlib.use('TKAgg')
+import matplotlib.pylab as plt
+plt.ion()
+from importlib import import_module
+
+# Quickly setup one of the 3 main platforms (adapt for your own purposes)
+# only reason I don't always import these is the extra time needed to get to REPL
+# to enable a platform, type: 'mxe', 'tch', or 'tfe' for MXNet, PyTorch, or Tensorflow
+tf=None
+mx=None
+torch=None
+# Note, anything that runs globals() will execute these...
+class Tfe(object):
+    def __repr__(self):
+        global tf
+        tf=import_module('tensorflow')
+        tf.enable_eager_execution()
+        print('Warning, Eager execution enabled')
+        return ''
+tfe=Tfe()
+
+class Mxe(object):
+    def __repr__(self):
+        global mx
+        mx=import_module('mxnet')
+        return ''
+mxe=Mxe()
+
+class Tch(object):
+    def __repr__(self):
+        global torch
+        torch=import_module('torch')
+        return ''
+tch=Tch()
+
+# useful helper for getting current working directory
+class Pwd(object):
+    def __repr__(self):
+        return str(os.getcwd())
+pwd = Pwd()
+
+# this can be useful for printing what's in memory, but not if there is a huge numpy array present...
+class Whos(object):
+    def __init__(self, ns=False):
+        self.ns=ns
+    def __repr__(self):
+        keys=[v for v in globals().keys() if not v.startswith('_') and not v.startswith('whos')]
+        # print module/functions only (namespace or not)
+        if self.ns:
+            # include if the key is a module OR a function or a class
+            keys=[v for v in keys if type(globals()[v])==type(np) or type(globals()[v])==type(Pwd()) or type(globals()[v]==type(pwd))]
+        else:
+            # include only if the key is NOT a module OR a function
+            keys=[v for v in keys if type(globals()[v])!=type(np) and type(globals()[v])!=type(Pwd()) and type(globals()[v]!=type(pwd)) and type(globals()[v])!=type(type(1))]
+
+        # if not listing classes or modules, print out the size of all numpy arrays
+        # print in format: Variable Type Shape Data
+        if not self.ns:
+            sys.stdout.write('Variable\t\tType\t\tShape\t\tData[:8]\n')
+            for i in range(len(keys)):
+                v=keys[i]
+                if type(globals()[v])==type(np.array(0)):
+                    sys.stdout.write(v+'\t\t'+str(type(globals()[v])).strip('<type \'').strip('\'>') + '\t\t' + str(globals()[v].shape) + '\t\t'+                 str(globals()[v].flat[:8]))
+                    if i<len(keys)-1:
+                        sys.stdout.write('\n')
+            keys=''
+        return str(keys)
+whos = Whos()
+whosns = Whos(True)
+
+def convert_tensor_to_img(img, autoscale=False, disparity_not_flow=True):
+    # check if tensor or numpy
+    if type(img) != type(np.array(0)):
+        if 'mx' in globals() and type(img)==mx.ndarray.ndarray.NDArray:
+            # mxnet
+            img=img.asnumpy()
+        else:
+            # torch or tf, assume its already loaded
+            img=img.numpy()
+    # check if batch, take first image if so
+    if len(img.shape)==4:
+        img=img[0,:,:,:]
+    # check if 3D and if first dim > 3rd dims
+    if len(img.shape)==3 and img.shape[0]<img.shape[2]:
+        img=np.transpose(img,(1,2,0))
+
+    # From here on, img is numpy, its 2D or 3D and its in HWC format
+    # data string to add min/max to plot title
+    dstring=': '+str([np.min(img), np.max(img)])
+    if len(img.shape)==3 and img.shape[2]==2:
+        # disparity or optical flow image
+        if disparity_not_flow:
+                img=post_process_disparity(img)
+                imtype='Disparity'
+        else:
+                print('flow, shape='+str(img.shape))
+                img=flow2rgb(img.astype(np.float32), None)
+                imtype='Flow'
+    elif len(img.shape)==3 and img.shape[2]>3:
+        # segmentation image
+        img=np.argmax(img,axis=2).astype(np.float32)
+        print(np.unique(img))
+        imtype='Segmentation'
+    else:
+        imtype='Visible'
+
+    # grayscale single channel
+    if len(img.shape)==3 and img.shape[2]==1:
+        img=img[:,:,0].astype(np.float32)
+
+    # autoscale image for display
+    if autoscale:
+        img=img-np.min(img.flatten())
+        img=img/np.max(img.flatten())
+    return [img, imtype, dstring]
+
+def flow2rgb(flow_map_np, max_value):
+    # detect if in CHW or HWC forms -> convert to other form
+    img_format_c_first=True
+    if flow_map_np.shape[2]==2:
+        img_format_c_first=False
+        flow_map_np=np.transpose(flow_map_np,(2,0,1))
+    _, h, w = flow_map_np.shape
+    #flow_map_np[:,(flow_map_np[0] == 0) & (flow_map_np[1] == 0)] = float('nan')
+    mask = (flow_map_np[0] == 0) & (flow_map_np[1] == 0)
+    rgb_map = np.ones((3,h,w)).astype(np.float32)
+    if max_value is not None:
+        normalized_flow_map = flow_map_np / max_value
+    else:
+        normalized_flow_map = flow_map_np / (np.abs(flow_map_np).max())
+    rgb_map[0] += normalized_flow_map[0]
+    rgb_map[1] -= 0.5*(normalized_flow_map[0] + normalized_flow_map[1])
+    rgb_map[2] += normalized_flow_map[1]
+    rgb_map = rgb_map.clip(0,1)
+    # set all masked pixels to high
+    rgb_map[:,mask]=1.0
+    # if it wasn't in CHW format originally, then we want to return in the original format HWC
+    if not img_format_c_first:
+        rgb_map=np.transpose(rgb_map,(1,2,0))
+    return rgb_map
+
+def post_process_disparity(disp):
+    h, w, _ = disp.shape
+    l_disp = disp[:,:,0]
+    r_disp = disp[:,:,1]
+    m_disp = 0.5 * (l_disp + r_disp)
+    l, _ = np.meshgrid(np.linspace(0, 1, w), np.linspace(0, 1, h))
+    l_mask = 1.0 - np.clip(20 * (l - 0.05), 0, 1)
+    r_mask = l_mask
+    return r_mask * l_disp + l_mask * r_disp + (1.0 - l_mask - r_mask) * m_disp
+
+# helper functions for matlab-like quick display
+def imagesc(ima):
+    # auto-detect NHWC, NCHW, HWC, HW, CHW
+    # auto-convert from tensor or list of lists or whatever into numpy array
+    [img,dtype,imstring]=convert_tensor_to_img(ima)
+    # auto-scale 0-255, pop up colorbar scaled to original data
+    imgsc=img-np.min(img.flatten())
+    imgsc=(255*imgsc.astype(np.float)/np.max(imgsc.flatten())).astype(np.uint8)
+    # if channel count is 3, display RGB, elseif 1 display gray, elseif 2 display both as greys next to each other
+    # else if >3, display np.argmax on channel dim
+    # print max/min/mean/std by channel if C=2 or 3, otherwise global
+    # use my mxnet display converter to do all this but extend to tensorflow/torch capability
+    print([img.min(), img.max(), np.mean(img.flatten()), np.std(img.flatten())])
+    if not _internal_hold_on_plt:
+        plt.clf()
+    if len(img.shape)>2:
+        plt.imshow(imgsc)
+    else:
+        plt.imshow(imgsc, cmap=plt.cm.binary)
+    plt.colorbar()
+    plt.xticks([])
+    plt.yticks([])
+    plt.grid(False)
+    plt.title(imstring)
+
+def imagescl(ima, delay=0.2):
+    # loop over images in a batch (assumes ima is a 4D)
+    import time
+    for i in range(ima.shape[0]):
+        imagesc(ima[i])
+        plt.show()
+        plt.pause(delay)
+        #time.sleep(delay)
+
+def close():
+    plt.close()
+
+_internal_hold_on_plt=False
+def hold_on():
+    global _internal_hold_on_plt
+    _internal_hold_on_plt=not _internal_hold_on_plt
+
+def plot(data, xlim=None, ylim=None):
+    # auto-convert from tensor, list or whatever
+    [img,dtype,imstring]=convert_tensor_to_img(data)
+    # flatten if ??
+    img=img.flatten()
+    if not _internal_hold_on_plt:
+        plt.clf()
+    plt.plot(img)
+    plt.title(imstring)
+    # zoom to xlim, ylim
+    if xlim is not None and len(xlim)==2:
+        plt.xlim(xlim)
+    if ylim is not None and len(ylim)==2:
+        plt.ylim(ylim)
+    # print max/min/mean/std
+    print([img.min(), img.max(), np.mean(img.flatten()), np.std(img.flatten())])
+
+def hist(data, nbins=10, xmin=None, xmax=None):
+    # auto-convert from tensor, list or whatever
+    [img,dtype,imstring]=convert_tensor_to_img(data)
+    img=img.flatten()
+    # where xmin, xmax are either provided or determined from data
+    if xmin is None:
+        xmin=data.min()
+    if xmax is None:
+        xmax=data.max()
+    # np.linspace from xmin,xmax,nums
+    if not _internal_hold_on_plt:
+        plt.clf()
+    plt.hist(img,bins=np.linspace(xmin,xmax,nbins))
+
+from PIL import Image
+imread = lambda imgfile: np.array(Image.open(imgfile))
+imwrite = lambda img,imgfile: Image.fromarray(img).save(imgfile) #,'JPEG')
+
+def quickimages(usedir='./',batch_size=8, imsize=300):
+    import glob
+    files=glob.glob(usedir+'/*.jpg')
+    from skimage.io import imread
+    batch=[imread(f) for f in files[0:batch_size]]
+    #from skimage.transform import resize
+    #nbatch=[resize(b, (imsize,imsize)).astype(np.uint8) for b in batch]
+    nbatch=np.asarray(batch)
+    return nbatch
+
+'''
+# use the below to import useful helpers from my pythonrc when running non-interactively
+import importlib
+importlib.machinery.SOURCE_SUFFIXES.append('')
+spec = importlib.util.spec_from_file_location('imagesc', '/Users/erikbeall/.pythonrc')
+ebb = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(ebb)
+imagesc=ebb.imagesc
+imagescl=ebb.imagescl
+convert_tensor_to_img=ebb.convert_tensor_to_img
+hist=ebb.hist
+'''
+
+
